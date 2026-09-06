@@ -44,7 +44,9 @@ export const ESCALATION_TARGETS: readonly SandboxMode[] = ['workspace-write', 'd
  * Validate the escalation argument pairing a tool schema cannot express:
  * `sandbox_permissions` and `justification` travel together — an approval
  * prompt without a reason, or a reason driving nothing, is a malformed ask —
- * and the justification must be a non-empty sentence.
+ * and the justification must be a non-empty sentence. Exception: an
+ * equal-mode (no-op) ask is normalized away by {@link normalizeEscalationMode}
+ * before this validation runs, so it never requires a justification.
  * @param sandboxPermissions - the raw `sandbox_permissions` argument, if given.
  * @param justification - the raw `justification` argument, if given.
  */
@@ -58,6 +60,27 @@ export function validateEscalationArgs(sandboxPermissions: string | undefined, j
   if (justification !== undefined && justification.trim().length === 0) {
     throw new Error('invalid justification: expected a non-empty sentence')
   }
+}
+
+/**
+ * Resolve a call's escalation ask against its effective mode: `undefined`
+ * when the request is absent OR asks for the mode the call already runs under
+ * (a no-op grant — nothing widens, so no justification and no approval are
+ * ever required), otherwise the requested mode unchanged so the existing
+ * validation and fail-closed approval sequence applies. Consumers MUST call
+ * this BEFORE {@link validateEscalationArgs} decides whether an ask needs a
+ * justification: an equal-mode ask must not be rejected for lacking one, and
+ * the approval channel must not be consulted for a grant that changes
+ * nothing. Consumers still validate the pairing for a genuine escalation and
+ * for a stray `justification` carrying no `sandbox_permissions`, so that
+ * malformed ask stays rejected.
+ * @param requestedMode - the raw `sandbox_permissions` argument, if given.
+ * @param effectiveMode - the standing policy's mode, if any.
+ * @returns `undefined` for absent/equal requests, else the requested mode.
+ */
+export function normalizeEscalationMode(requestedMode: string | undefined, effectiveMode: SandboxMode | undefined): string | undefined {
+  if (requestedMode === undefined || requestedMode === effectiveMode) return undefined
+  return requestedMode
 }
 
 /**
@@ -149,13 +172,20 @@ export interface EscalationRequest {
  * non-widening request, a missing approval service, an agent-less execution,
  * a rejection, a cancellation, an unanswerable ask) — the tool registry turns
  * the throw into the call's isError result, and nothing has run. A
- * non-widening request never prompts a human.
+ * non-widening request never prompts a human; a request for the mode the call
+ * already runs under is granted immediately as a no-op — nothing widens, so
+ * nothing needs approval.
  * @param request - the escalation to judge (see {@link EscalationRequest}).
  * @param approval - the approval ingredients the tool holds (see {@link EscalationApproval}).
  * @returns the granted mode, consumed by the one call that asked.
  */
 export async function approveEscalation<A, C>(request: EscalationRequest, approval: EscalationApproval<A, C>): Promise<SandboxMode> {
   const { requestedMode: mode, effectiveMode, justification, subject } = request
+  // A request for the mode the call already runs under is a no-op grant: the
+  // call is already at that level, so nothing widens and nothing needs
+  // approval — a same-mode ask must not be rejected as a failed escalation.
+  // Consumers normalize this away first; kept here as defense-in-depth.
+  if (mode === effectiveMode) return effectiveMode
   // Strict widening is an EXECUTION check against the call's effective mode —
   // deliberately not a schema constraint (the enum is the closed target
   // vocabulary; the effective mode is per-call truth).

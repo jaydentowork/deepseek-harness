@@ -13,7 +13,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
-import { ESCALATION_TARGETS, approveEscalation, escalationHintMarker, sandboxDenialMarker, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
+import { ESCALATION_TARGETS, approveEscalation, escalationHintMarker, normalizeEscalationMode, sandboxDenialMarker, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import { FsError } from '@deepseek-ai/dsh-fs'
 
@@ -62,11 +62,12 @@ export class FsSandboxController {
         type: 'string',
         enum: [...this.escalationModes],
         description: 'The wider sandbox mode this file operation needs. Only valid as a one-shot retry '
-          + 'of an operation the sandbox just denied; requires justification and user approval.',
+          + 'of an operation the sandbox just denied; escalating to a strictly wider mode requires '
+          + 'justification and user approval; a retry at the call\'s current effective mode is accepted as a no-op.',
       },
       justification: {
         type: 'string',
-        description: 'Required with sandbox_permissions: one sentence for the user explaining '
+        description: 'Required with sandbox_permissions for a strictly wider mode: one sentence for the user explaining '
           + 'why this exact file operation needs the wider access.',
       },
     }
@@ -77,7 +78,9 @@ export class FsSandboxController {
    * strictly wider retry resolved through `ctx.approval` before anything
    * executes), else the session's standing mode. The calling session's cwd is
    * always carried as the workspace root. Validates the escalation argument
-   * pairing first.
+   * pairing whenever either field is present, then normalizes the ask: an
+   * absent or same-mode request is a no-op granted by the standing policy
+   * itself and never consults the approval channel.
    * @param toolName - the mutating tool's name, for the approval audit trail.
    * @param args - the call's escalation arguments.
    * @param exec - the tool-execution context (agent, callId, signal).
@@ -85,9 +88,18 @@ export class FsSandboxController {
    *   unsandboxed backend.
    */
   async resolvePolicy(toolName: string, args: FsEscalationArgs, exec: ToolExecution): Promise<SandboxExecutionPolicy | undefined> {
-    validateEscalationArgs(args.sandbox_permissions, args.justification)
     const standingPolicy = this.policy?.resolve({ ...exec.agent ? { session: exec.agent.session } : {} })
-    if (args.sandbox_permissions === undefined || args.justification === undefined) {
+    // A no-op escalation ask (absent, or requesting the mode the call already
+    // runs under) is granted by the standing policy itself: it must skip the
+    // approval channel entirely, since nothing widens, and needs no
+    // justification. The pairing is still validated for a genuine escalation
+    // and for a stray `justification` sent with no `sandbox_permissions` at
+    // all, so that malformed ask stays rejected.
+    const requestedMode = normalizeEscalationMode(args.sandbox_permissions, standingPolicy?.mode)
+    if (requestedMode !== undefined || args.sandbox_permissions === undefined) {
+      validateEscalationArgs(args.sandbox_permissions, args.justification)
+    }
+    if (requestedMode === undefined || args.justification === undefined) {
       return standingPolicy
     }
     if (this.escalationModes.length === 0) {
@@ -95,7 +107,7 @@ export class FsSandboxController {
     }
     const policy = standingPolicy as SandboxExecutionPolicy
     const approvedMode = await approveEscalation(
-      { requestedMode: args.sandbox_permissions, justification: args.justification, effectiveMode: policy.mode, subject: 'operation' },
+      { requestedMode, justification: args.justification, effectiveMode: policy.mode, subject: 'operation' },
       {
         approver: this.ctx.get('approval'),
         agent: exec.agent,

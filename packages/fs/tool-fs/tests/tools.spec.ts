@@ -962,11 +962,24 @@ describe('sandbox escalation API (write/edit)', () => {
     expect(text(result)).toContain('no agent to route it through')
   })
 
-  it('rejects the escalation argument pairing (one field without the other)', async () => {
+  it('rejects a genuinely widening sandbox_permissions with no justification (the pairing contract)', async () => {
     const { ctx } = await setupConfining()
-    const missing = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'workspace-write' }, escalationAgent())
+    const missing = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'danger-full-access' }, escalationAgent())
     expect(missing.isError).toBe(true)
     expect(text(missing)).toContain('sandbox_permissions requires a justification')
+  })
+
+  it('rejects a stray justification with no sandbox_permissions (the pairing contract)', async () => {
+    const { ctx } = await setupConfining()
+    const stray = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', justification: 'why' }, escalationAgent())
+    expect(stray.isError).toBe(true)
+    expect(text(stray)).toContain('justification is only valid together with sandbox_permissions')
+  })
+
+  it('grants a same-mode sandbox_permissions ask without justification (no-op, no approval channel)', async () => {
+    const { ctx } = await setupConfining({ approval: true })
+    const result = await call(ctx, 'write', { file_path: 'a.txt', content: 'x', sandbox_permissions: 'workspace-write' }, escalationAgent())
+    expect(result.isError).toBeFalsy()
   })
 
   it('sandbox_permissions under a non-confining backend fails closed (unadvertised field still reaches execute)', async () => {

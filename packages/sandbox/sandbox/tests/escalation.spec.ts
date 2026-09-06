@@ -12,6 +12,7 @@ import {
   WIDER_MODES,
   approveEscalation,
   escalationHintMarker,
+  normalizeEscalationMode,
   sandboxDenialMarker,
   validateEscalationArgs,
 } from '@deepseek-ai/dsh-sandbox'
@@ -54,6 +55,28 @@ describe('the model-facing markers', () => {
   })
 })
 
+describe('normalizeEscalationMode', () => {
+  it('normalizes an absent ask away', () => {
+    expect(normalizeEscalationMode(undefined, 'read-only')).toBeUndefined()
+    expect(normalizeEscalationMode(undefined, undefined)).toBeUndefined()
+  })
+
+  it('normalizes a same-mode ask away at every mode (the no-op grant)', () => {
+    expect(normalizeEscalationMode('danger-full-access', 'danger-full-access')).toBeUndefined()
+    expect(normalizeEscalationMode('workspace-write', 'workspace-write')).toBeUndefined()
+    expect(normalizeEscalationMode('read-only', 'read-only')).toBeUndefined()
+  })
+
+  it('passes a genuinely different ask through unchanged, widening or narrowing', () => {
+    expect(normalizeEscalationMode('danger-full-access', 'read-only')).toBe('danger-full-access')
+    expect(normalizeEscalationMode('workspace-write', 'danger-full-access')).toBe('workspace-write')
+  })
+
+  it('passes an ask through when no standing policy names an effective mode', () => {
+    expect(normalizeEscalationMode('workspace-write', undefined)).toBe('workspace-write')
+  })
+})
+
 describe('approveEscalation', () => {
   const req = (over: Partial<Parameters<typeof approveEscalation>[0]> = {}) => ({
     requestedMode: 'workspace-write',
@@ -81,12 +104,24 @@ describe('approveEscalation', () => {
     expect(seen[0]?.reason).toBe('escalate sandbox to workspace-write: the user asked to write in the workspace')
   })
 
+  it('a same-mode ask is granted immediately as a no-op and never asks (defense-in-depth)', async () => {
+    const seen: unknown[] = []
+    const spy = ingredients({ approver: approver('rejected', r => seen.push(r)) })
+    await expect(approveEscalation(req({ requestedMode: 'read-only' }), spy)).resolves.toBe('read-only')
+    await expect(approveEscalation(req({ requestedMode: 'danger-full-access', effectiveMode: 'danger-full-access' as never }), spy))
+      .resolves.toBe('danger-full-access')
+    // No approval service and no agent are still fine: nothing widens.
+    await expect(approveEscalation(req({ requestedMode: 'read-only' }), ingredients({ approver: undefined, agent: undefined })))
+      .resolves.toBe('read-only')
+    expect(seen).toEqual([])
+  })
+
   it('a non-widening request fails closed with its own text and never asks', async () => {
     const seen: unknown[] = []
     const spy = ingredients({ approver: approver('allowed-once', r => seen.push(r)) })
-    await expect(approveEscalation(req({ requestedMode: 'read-only' }), spy))
-      .rejects.toThrow(/not strictly wider than this call's current "read-only" mode/)
     await expect(approveEscalation(req({ requestedMode: 'workspace-write', effectiveMode: 'danger-full-access' as never }), spy))
+      .rejects.toThrow(/not strictly wider than this call's current "danger-full-access" mode/)
+    await expect(approveEscalation(req({ requestedMode: 'read-only', effectiveMode: 'workspace-write' as never }), spy))
       .rejects.toThrow(/not strictly wider/)
     expect(seen).toEqual([])
   })

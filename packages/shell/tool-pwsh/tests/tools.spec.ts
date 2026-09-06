@@ -632,7 +632,7 @@ describe('sandbox escalation through ctx.approval', () => {
     const { ctx } = await setupSandboxed(true)
     const prompted = vi.fn()
     ctx.on('approval/request', () => { prompted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
-    const result = await call(ctx, 'pwsh', { ...escalate, sandbox_permissions: 'workspace-write' }, sandboxAgent('workspace-write'))
+    const result = await call(ctx, 'pwsh', { ...escalate, sandbox_permissions: 'workspace-write' }, sandboxAgent('danger-full-access'))
     expect(text(result)).toContain('not strictly wider')
     expect(prompted).not.toHaveBeenCalled()
 
@@ -642,6 +642,22 @@ describe('sandbox escalation through ctx.approval', () => {
       data: Record<string, unknown>,
     ) => unknown)('sandbox/mode', { mode: 'unknown-mode' })
     expect(text(await call(ctx, 'pwsh', escalate, malformed))).toContain('not strictly wider')
+  })
+
+  it('grants a same-mode sandbox_permissions ask without prompting or justification (no-op)', async () => {
+    const { ctx } = await setupSandboxed(true)
+    const prompted = vi.fn()
+    ctx.on('approval/request', () => { prompted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
+    // Same-mode ask: standing policy is `workspace-write`, request is `workspace-write`.
+    const result = await call(ctx, 'pwsh', escalate, sandboxAgent('workspace-write'))
+    expect(text(result)).toContain('ok')
+    expect(prompted).not.toHaveBeenCalled()
+
+    // Same-mode ask with NO justification must also succeed (the no-op does not need one).
+    const noJustify = await setupSandboxed(true)
+    noJustify.ctx.on('approval/request', () => Promise.resolve<ApprovalOutcome>('allowed-once'))
+    const resultNoJ = await call(noJustify.ctx, 'pwsh', { command: 'Write-Output ok', description: 'no justify', sandbox_permissions: 'workspace-write' }, sandboxAgent('workspace-write'))
+    expect(text(resultNoJ)).toContain('ok')
   })
 
   it('fails closed when approval cannot be routed', async () => {

@@ -30,7 +30,7 @@ import type {} from '@deepseek-ai/dsh-jobs'
 import type {} from '@deepseek-ai/dsh-shell-env'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
-import { ESCALATION_TARGETS, approveEscalation, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
+import { ESCALATION_TARGETS, approveEscalation, normalizeEscalationMode, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { parseExitStatus } from '@deepseek-ai/dsh-shell'
@@ -93,9 +93,6 @@ function validatePwshArgs(args: PwshToolArgs): void {
   if (args.timeoutMs !== undefined && (!Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0)) {
     throw new Error(`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`)
   }
-  // The escalation pairing (sandbox_permissions ⇔ justification, non-empty) is
-  // the shared rule both enforcing families validate identically.
-  validateEscalationArgs(args.sandbox_permissions, args.justification)
 }
 /* jscpd:ignore-end */
 
@@ -269,11 +266,11 @@ export function apply(ctx: Context, config: Config = {}): void {
         sandbox_permissions: {
           type: 'string' as const,
           enum: [...escalationModes],
-          description: 'The wider sandbox mode this command needs. Only valid as a one-shot retry of a command the sandbox just denied; requires justification and user approval.',
+          description: 'The wider sandbox mode this command needs. Only valid as a one-shot retry of a command the sandbox just denied; escalating to a strictly wider mode requires justification and user approval; a retry at the call\'s current effective mode is accepted as a no-op.',
         },
         justification: {
           type: 'string' as const,
-          description: 'Required with sandbox_permissions: one sentence for the user explaining why this exact command needs the wider access.',
+          description: 'Required with sandbox_permissions for a strictly wider mode: one sentence for the user explaining why this exact command needs the wider access.',
         },
       } : {},
     },
@@ -344,11 +341,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     /* jscpd:ignore-start -- the execute path mirrors dsh-tool-bash's by design (see the pwsh-tool-and-executor Agent Note). */
     async execute(args: PwshToolArgs, exec) {
-      validatePwshArgs(args)
       // Description is display metadata; workdir defaults to the caller's session.
       const standingPolicy = resolveSandboxPolicy(exec)
-      const approvedMode = args.sandbox_permissions !== undefined && args.justification !== undefined
-        ? await approvePwshEscalation(args.sandbox_permissions, args.justification, exec, standingPolicy)
+      // A no-op escalation ask (absent, or requesting the mode the call
+      // already runs under) skips the approval channel entirely: it is
+      // granted by the standing policy itself, and needs no justification.
+      // The pairing is still validated for a genuine escalation and for a
+      // stray `justification` sent with no `sandbox_permissions` at all, so
+      // that malformed ask stays rejected.
+      const escalationMode = normalizeEscalationMode(args.sandbox_permissions, standingPolicy?.mode)
+      validatePwshArgs(args)
+      if (escalationMode !== undefined || args.sandbox_permissions === undefined) {
+        validateEscalationArgs(args.sandbox_permissions, args.justification)
+      }
+      const approvedMode = escalationMode !== undefined && args.justification !== undefined
+        ? await approvePwshEscalation(escalationMode, args.justification, exec, standingPolicy)
         : undefined
       const policy = approvedMode === undefined
         ? standingPolicy
