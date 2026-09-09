@@ -44,6 +44,7 @@ declare module '@deepseek-ai/cordis' {
 /** Registry and cross-page router behind the two model-facing inspect tools. */
 export class CordisInspectRegistryService extends Service {
   private readonly providers = new Map<string, HostCordisInspectProviderRegistration>()
+  private readonly providerRefs = new Map<string, number>()
   private readonly pending = new Map<CordisInspectRequestId, PendingClientQuery>()
   private clientManifest: readonly CordisInspectProviderManifest[] | undefined
   private nextRequest = 1
@@ -54,18 +55,49 @@ export class CordisInspectRegistryService extends Service {
   }
 
   /**
-   * Register one Host provider.
+   * Register one Host provider, joining an identical existing registration.
+   *
+   * Every Agent session that mounts `tool-cordis` registers the same stateless
+   * Host providers (`Service`, `Event`, `Builtin`, `Tool`), so a second
+   * concurrent session must share the first registration instead of colliding
+   * with it. These providers resolve their Agent from the per-query context
+   * rather than the mounting Fiber, so one shared instance answers every
+   * session correctly. A reference count keeps it alive until the last mount
+   * disposes; a different manifest under the same id is still a real conflict.
    * @param registration - manifest and local query handler.
-   * @returns idempotent disposer.
+   * @returns idempotent disposer releasing only this mount's reference.
    */
   register(registration: HostCordisInspectProviderRegistration): () => void {
     const manifest = validateManifest(registration.manifest)
-    if (this.providers.has(manifest.id)) throw new Error(`Host Cordis inspect provider "${manifest.id}" is already registered`)
-    const stored = { ...registration, manifest }
-    this.providers.set(manifest.id, stored)
-    return () => {
-      if (this.providers.get(manifest.id) === stored) this.providers.delete(manifest.id)
+    const existing = this.providers.get(manifest.id)
+    if (existing !== undefined && JSON.stringify(existing.manifest) !== JSON.stringify(manifest)) {
+      throw new Error(`Host Cordis inspect provider "${manifest.id}" is already registered with a different manifest`)
     }
+    const stored = existing ?? { ...registration, manifest }
+    if (existing === undefined) this.providers.set(manifest.id, stored)
+    this.providerRefs.set(manifest.id, (this.providerRefs.get(manifest.id) ?? 0) + 1)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.releaseProvider(manifest.id, stored)
+    }
+  }
+
+  /**
+   * Drop one mount's reference, removing the provider once none remain.
+   * @param id - provider id being released.
+   * @param stored - registration this disposer holds a reference to.
+   */
+  private releaseProvider(id: string, stored: HostCordisInspectProviderRegistration): void {
+    if (this.providers.get(id) !== stored) return
+    const remaining = (this.providerRefs.get(id) ?? 1) - 1
+    if (remaining > 0) {
+      this.providerRefs.set(id, remaining)
+      return
+    }
+    this.providerRefs.delete(id)
+    this.providers.delete(id)
   }
 
   /**
